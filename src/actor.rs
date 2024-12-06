@@ -1,40 +1,79 @@
 use log::{error, info, trace, warn};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::Duration;
 use uuid::Uuid;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-
-pub(crate) struct Message {
-    id: Uuid,
-    content: String,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Message<T>
+{
+    pub id: Uuid,
+    pub data: T,
+}
+pub(crate) struct Peer<T>
+{
+    pub(crate) sender: broadcast::Sender<Message<T>>,
+    pub(crate) receiver: broadcast::Receiver<Message<T>>,
 }
 
-pub(crate) struct Peer {
-    pub(crate) sender: broadcast::Sender<Message>,
-    pub(crate) receiver: broadcast::Receiver<Message>,
-}
-
-#[derive(Clone)]
-pub(crate) struct Actor {
+pub(crate) struct Actor<T>
+{
     id: String,
-    peers: Arc<RwLock<HashMap<String, Peer>>>,
-    pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
+    peers: Arc<RwLock<HashMap<String, Peer<T>>>>,
+    pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<T>>>>,
+    request_handler: Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>,
 }
 
-impl Actor {
+pub(crate) struct ActorBuilder<T>
+{
+    id: String,
+    request_handler: Option<Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>>,
+}
+
+impl<T> ActorBuilder<T>
+{
     pub(crate) fn new(id: String) -> Self {
-        Actor {
+        Self {
             id,
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            request_handler: None,
         }
     }
 
-    async fn run(&self) {
+    pub(crate) fn with_request_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Message<T>, String) -> T + Send + Sync + 'static,
+    {
+        self.request_handler = Some(Arc::new(handler));
+        self
+    }
+
+    pub(crate) fn build(self) -> Actor<T> {
+        Actor {
+            id: self.id,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            request_handler: self.request_handler.unwrap_or_else(|| {
+                Arc::new(|msg, _| {
+                    msg.data
+                })
+            }),
+        }
+    }
+}
+
+impl<T> Actor<T>
+where
+    T: Clone + Debug + Send + Sync + 'static,
+{
+    pub(crate) fn builder(id: String) -> ActorBuilder<T> {
+        ActorBuilder::new(id)
+    }
+
+    pub(crate) async fn run(&self) {
         info!("Actor {} started", self.id);
         loop {
             let mut peer_receivers = Vec::new();
@@ -80,7 +119,8 @@ impl Actor {
             }
         }
     }
-    async fn handle_message(&self, peer_id: String, msg: Message) {
+
+    async fn handle_message(&self, peer_id: String, msg: Message<T>) {
         let is_response = self.pending_requests.lock().await.contains_key(&msg.id);
         trace!("{} is_response: {}", self.id, is_response);
         if is_response {
@@ -88,32 +128,25 @@ impl Actor {
             self.handle_response(msg).await;
         } else {
             info!("{} received request from {}: {:?}", self.id, peer_id, msg);
-            let response = self.handle_request(msg, peer_id.clone()).await;
+            let response_data = (self.request_handler)(msg.clone(), peer_id.clone());
+            let response = Message {
+                id: msg.id,
+                data: response_data,
+            };
             self.send_message(peer_id, response).await;
         }
     }
 
-    async fn handle_request(&self, msg: Message, sender: String) -> Message {
-        info!(
-            "{} processing request from {}: {}",
-            self.id, sender, msg.content
-        );
-        Message {
-            id: msg.id,
-            content: format!("Response from {}: Processed {}", self.id, msg.content),
-        }
-    }
-
-    async fn handle_response(&self, msg: Message) {
+    async fn handle_response(&self, msg: Message<T>) {
         let mut pending = self.pending_requests.lock().await;
         if let Some(sender) = pending.remove(&msg.id) {
-            let _ = sender.send(msg.content);
+            let _ = sender.send(msg.data);
         } else {
             error!("{} couldn't find pending request {}", self.id, msg.id);
         }
     }
 
-    async fn send_message(&self, target: String, message: Message) {
+    async fn send_message(&self, target: String, message: Message<T>) {
         info!("{} sending message to {}: {:?}", self.id, target, message);
         let peers = self.peers.read().await;
         if let Some(peer) = peers.get(&target) {
@@ -126,11 +159,11 @@ impl Actor {
         }
     }
 
-    async fn send_request(
+    pub(crate) async fn send_request(
         &self,
         target: &str,
-        content: String,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+        content: T,
+    ) -> Result<T, Box<dyn std::error::Error>> {
         let request_id = Uuid::new_v4();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -141,7 +174,7 @@ impl Actor {
 
         let request = Message {
             id: request_id,
-            content,
+            data: content,
         };
 
         self.send_message(target.to_string(), request).await;
@@ -156,7 +189,7 @@ impl Actor {
         }
     }
 
-    pub(crate) async fn connect(&self, peer_id: String, peer: Peer) {
+    pub(crate) async fn connect(&self, peer_id: String, peer: Peer<T>) {
         let mut peers = self.peers.write().await;
         peers.insert(peer_id.clone(), peer);
         trace!("{} connected to peer {}", self.id, peer_id);
@@ -173,14 +206,20 @@ impl Actor {
 mod tests {
     use super::*;
 
-    async fn create_actor(id: String) -> Arc<Actor> {
-        let actor = Arc::new(Actor::new(id));
+    async fn create_actor(id: String) -> Arc<Actor<String>> {
+        let actor = Arc::new(
+            Actor::builder(id)
+                .with_request_handler(|msg, sender| {
+                    format!("Response from {}: Processed {}", sender, msg.data)
+                })
+                .build(),
+        );
         let actor_clone = actor.clone();
         tokio::spawn(async move { actor_clone.run().await });
         actor
     }
 
-    async fn connect_actors(actor1: &Arc<Actor>, actor2: &Arc<Actor>) {
+    async fn connect_actors(actor1: &Arc<Actor<String>>, actor2: &Arc<Actor<String>>) {
         let (tx1, rx1) = broadcast::channel(100);
         let (tx2, rx2) = broadcast::channel(100);
         actor1
