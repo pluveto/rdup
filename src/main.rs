@@ -22,14 +22,13 @@ struct Message {
 }
 
 #[derive(Debug, Clone)]
-enum ActorType {
+enum Kind {
     Leader,
     Follower,
 }
 
 struct Actor {
     id: String,
-    actor_type: ActorType,
     mailbox: mpsc::Receiver<Message>,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
@@ -38,7 +37,6 @@ struct Actor {
 #[derive(Clone)]
 struct ActorHandle {
     id: String,
-    actor_type: ActorType,
     sender: mpsc::Sender<Message>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
@@ -149,7 +147,6 @@ impl ActorHandle {
 
 async fn spawn_actor(
     id: String,
-    actor_type: ActorType,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
 ) -> ActorHandle {
     let (tx, rx) = mpsc::channel(100);
@@ -157,7 +154,6 @@ async fn spawn_actor(
 
     let actor = Actor {
         id: id.clone(),
-        actor_type: actor_type.clone(),
         mailbox: rx,
         peers: Arc::clone(&peers),
         pending_requests: Arc::clone(&pending_requests),
@@ -167,7 +163,6 @@ async fn spawn_actor(
 
     ActorHandle {
         id,
-        actor_type,
         sender: tx.clone(),
         pending_requests,
         peers: Arc::clone(&peers),
@@ -183,20 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = Arc::new(Mutex::new(HashMap::new()));
 
-    let leader_handle =
-        spawn_actor("Leader".to_string(), ActorType::Leader, Arc::clone(&peers)).await;
-    let follower1_handle = spawn_actor(
-        "Follower1".to_string(),
-        ActorType::Follower,
-        Arc::clone(&peers),
-    )
-    .await;
-    let follower2_handle = spawn_actor(
-        "Follower2".to_string(),
-        ActorType::Follower,
-        Arc::clone(&peers),
-    )
-    .await;
+    let leader_handle = spawn_actor("Leader".to_string(), Arc::clone(&peers)).await;
+    let follower1_handle = spawn_actor("Follower1".to_string(), Arc::clone(&peers)).await;
+    let follower2_handle = spawn_actor("Follower2".to_string(), Arc::clone(&peers)).await;
 
     {
         let mut peers = peers.lock().await;
@@ -208,26 +192,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     match leader_handle
-        .send_request("Follower1", "Hello from Leader to Follower1".to_string())
+        .send_request("Follower1", "Hello".to_string())
         .await
     {
-        Ok(response) => info!("Leader received response from Follower1: {}", response),
+        Ok(response) => info!("Leader received: {}", response),
         Err(e) => error!("{}", e),
     }
 
     match leader_handle
-        .send_request("Follower2", "Hello from Leader to Follower2".to_string())
+        .send_request("Follower2", "Hello".to_string())
         .await
     {
-        Ok(response) => info!("Leader received response from Follower2: {}", response),
+        Ok(response) => info!("Leader received: {}", response),
         Err(e) => error!("{}", e),
     }
 
     match follower1_handle
-        .send_request("Leader", "Hello from Follower1 to Leader".to_string())
+        .send_request("Leader", "Hello".to_string())
         .await
     {
-        Ok(response) => info!("Follower1 received response from Leader: {}", response),
+        Ok(response) => info!("Follower1 received: {}", response),
         Err(e) => error!("{}", e),
     }
 
