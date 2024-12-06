@@ -23,22 +23,26 @@ struct Message {
 #[derive(Clone)]
 struct Actor {
     id: String,
-    sender: mpsc::Sender<Message>,
     receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
 }
 
 impl Actor {
-    async fn new(id: String, peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>) -> Self {
+    async fn new(
+        id: String,
+        peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
+    ) -> (Self, mpsc::Sender<Message>) {
         let (sender, receiver) = mpsc::channel(100);
-        Actor {
-            id,
+        (
+            Actor {
+                id,
+                receiver: Arc::new(Mutex::new(receiver)),
+                pending_requests: Arc::new(Mutex::new(HashMap::new())),
+                peers,
+            },
             sender,
-            receiver: Arc::new(Mutex::new(receiver)),
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            peers,
-        }
+        )
     }
 
     async fn run(&self) {
@@ -128,11 +132,11 @@ impl Actor {
 async fn spawn_actor(
     id: String,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
-) -> Actor {
-    let actor = Actor::new(id, Arc::clone(&peers)).await;
+) -> (Actor, mpsc::Sender<Message>) {
+    let (actor, sender) = Actor::new(id, Arc::clone(&peers)).await;
     let actor_clone = actor.clone();
     tokio::spawn(async move { actor_clone.run().await });
-    actor
+    (actor, sender)
 }
 
 #[tokio::main]
@@ -144,15 +148,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = Arc::new(Mutex::new(HashMap::new()));
 
-    let leader = spawn_actor("Leader".to_string(), Arc::clone(&peers)).await;
-    let follower1 = spawn_actor("Follower1".to_string(), Arc::clone(&peers)).await;
-    let follower2 = spawn_actor("Follower2".to_string(), Arc::clone(&peers)).await;
+    let (leader, leader_sender) = spawn_actor("Leader".to_string(), Arc::clone(&peers)).await;
+    let (follower1, follower1_sender) =
+        spawn_actor("Follower1".to_string(), Arc::clone(&peers)).await;
+    let (follower2, follower2_sender) =
+        spawn_actor("Follower2".to_string(), Arc::clone(&peers)).await;
 
     {
         let mut peers = peers.lock().await;
-        peers.insert("Leader".to_string(), leader.sender.clone());
-        peers.insert("Follower1".to_string(), follower1.sender.clone());
-        peers.insert("Follower2".to_string(), follower2.sender.clone());
+        peers.insert("Leader".to_string(), leader_sender.clone());
+        peers.insert("Follower1".to_string(), follower1_sender.clone());
+        peers.insert("Follower2".to_string(), follower2_sender.clone());
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
