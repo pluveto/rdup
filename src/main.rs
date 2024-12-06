@@ -21,31 +21,31 @@ struct Message {
     content: String,
 }
 
-#[derive(Debug, Clone)]
-enum Kind {
-    Leader,
-    Follower,
-}
-
+#[derive(Clone)]
 struct Actor {
     id: String,
-    mailbox: mpsc::Receiver<Message>,
-    peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
-    pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
-}
-
-#[derive(Clone)]
-struct ActorHandle {
-    id: String,
     sender: mpsc::Sender<Message>,
+    receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
 }
 
 impl Actor {
-    async fn run(mut self) {
+    async fn new(id: String, peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>) -> Self {
+        let (sender, receiver) = mpsc::channel(100);
+        Actor {
+            id,
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            peers,
+        }
+    }
+
+    async fn run(&self) {
         info!("Actor {} started", self.id);
-        while let Some(msg) = self.mailbox.recv().await {
+        let mut receiver = self.receiver.lock().await;
+        while let Some(msg) = receiver.recv().await {
             match msg.message_type {
                 MessageType::Request => {
                     info!("{} received request: {:?}", self.id, msg);
@@ -93,9 +93,7 @@ impl Actor {
             error!("{} couldn't find peer {}", self.id, message.target);
         }
     }
-}
 
-impl ActorHandle {
     async fn send_request(
         &self,
         target: &str,
@@ -117,7 +115,7 @@ impl ActorHandle {
             content,
         };
 
-        self.send_message(request).await?;
+        self.send_message(request).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -130,43 +128,16 @@ impl ActorHandle {
             Err(_) => Err("Request timed out".into()),
         }
     }
-
-    async fn send_message(&self, message: Message) -> Result<(), Box<dyn std::error::Error>> {
-        let peers = self.peers.lock().await;
-        let target = message.target.clone();
-        if let Some(sender) = peers.get(&target) {
-            info!("{} sending message: {:?}", self.id, message);
-            sender.send(message).await?;
-            info!("{} sent message to {}", self.id, target);
-            Ok(())
-        } else {
-            Err(format!("{} couldn't find peer {}", self.id, target).into())
-        }
-    }
 }
 
 async fn spawn_actor(
     id: String,
     peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
-) -> ActorHandle {
-    let (tx, rx) = mpsc::channel(100);
-    let pending_requests = Arc::new(Mutex::new(HashMap::new()));
-
-    let actor = Actor {
-        id: id.clone(),
-        mailbox: rx,
-        peers: Arc::clone(&peers),
-        pending_requests: Arc::clone(&pending_requests),
-    };
-
-    tokio::spawn(actor.run());
-
-    ActorHandle {
-        id,
-        sender: tx.clone(),
-        pending_requests,
-        peers: Arc::clone(&peers),
-    }
+) -> Actor {
+    let actor = Actor::new(id, Arc::clone(&peers)).await;
+    let actor_clone = actor.clone();
+    tokio::spawn(async move { actor_clone.run().await });
+    actor
 }
 
 #[tokio::main]
@@ -178,39 +149,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = Arc::new(Mutex::new(HashMap::new()));
 
-    let leader_handle = spawn_actor("Leader".to_string(), Arc::clone(&peers)).await;
-    let follower1_handle = spawn_actor("Follower1".to_string(), Arc::clone(&peers)).await;
-    let follower2_handle = spawn_actor("Follower2".to_string(), Arc::clone(&peers)).await;
+    let leader = spawn_actor("Leader".to_string(), Arc::clone(&peers)).await;
+    let follower1 = spawn_actor("Follower1".to_string(), Arc::clone(&peers)).await;
+    let follower2 = spawn_actor("Follower2".to_string(), Arc::clone(&peers)).await;
 
     {
         let mut peers = peers.lock().await;
-        peers.insert("Leader".to_string(), leader_handle.sender.clone());
-        peers.insert("Follower1".to_string(), follower1_handle.sender.clone());
-        peers.insert("Follower2".to_string(), follower2_handle.sender.clone());
+        peers.insert("Leader".to_string(), leader.sender.clone());
+        peers.insert("Follower1".to_string(), follower1.sender.clone());
+        peers.insert("Follower2".to_string(), follower2.sender.clone());
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    match leader_handle
-        .send_request("Follower1", "Hello".to_string())
-        .await
-    {
+    match leader.send_request("Follower1", "Hello".to_string()).await {
         Ok(response) => info!("Leader received: {}", response),
         Err(e) => error!("{}", e),
     }
 
-    match leader_handle
-        .send_request("Follower2", "Hello".to_string())
-        .await
-    {
+    match leader.send_request("Follower2", "Hello".to_string()).await {
         Ok(response) => info!("Leader received: {}", response),
         Err(e) => error!("{}", e),
     }
 
-    match follower1_handle
-        .send_request("Leader", "Hello".to_string())
-        .await
-    {
+    match follower1.send_request("Leader", "Hello".to_string()).await {
         Ok(response) => info!("Follower1 received: {}", response),
         Err(e) => error!("{}", e),
     }
