@@ -55,7 +55,7 @@ impl Actor {
                     match receiver.recv().await {
                         Ok(msg) => Some((peer_id, msg)),
                         Err(e) => {
-                            error!("Error receiving message: {:?}", e);
+                            error!("{} failed to receive message from {}: {}", self.id, peer_id, e);
                             None
                         }
                     }
