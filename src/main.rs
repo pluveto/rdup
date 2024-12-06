@@ -15,7 +15,6 @@ enum MessageType {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct Message {
     id: Uuid,
-    message_type: MessageType,
     sender: String,
     target: String,
     content: String,
@@ -46,16 +45,14 @@ impl Actor {
         info!("Actor {} started", self.id);
         let mut receiver = self.receiver.lock().await;
         while let Some(msg) = receiver.recv().await {
-            match msg.message_type {
-                MessageType::Request => {
-                    info!("{} received request: {:?}", self.id, msg);
-                    let response = self.process_request(msg).await;
-                    self.send_message(response).await;
-                }
-                MessageType::Response => {
-                    info!("{} received response: {:?}", self.id, msg);
-                    self.handle_response(msg).await;
-                }
+            let is_response = self.pending_requests.lock().await.contains_key(&msg.id);
+            if is_response {
+                info!("{} received response: {:?}", self.id, msg);
+                self.handle_response(msg).await;
+            } else {
+                info!("{} received request: {:?}", self.id, msg);
+                let response = self.process_request(msg).await;
+                self.send_message(response).await;
             }
         }
         info!("Actor {} stopped", self.id);
@@ -64,7 +61,6 @@ impl Actor {
     async fn process_request(&self, msg: Message) -> Message {
         Message {
             id: msg.id,
-            message_type: MessageType::Response,
             sender: self.id.clone(),
             target: msg.sender,
             content: format!("Response from {}: Processed {}", self.id, msg.content),
@@ -109,7 +105,6 @@ impl Actor {
 
         let request = Message {
             id: request_id,
-            message_type: MessageType::Request,
             sender: self.id.clone(),
             target: target.to_string(),
             content,
