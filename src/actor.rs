@@ -7,25 +7,26 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-struct Message {
+
+pub(crate) struct Message {
     id: Uuid,
     content: String,
 }
 
-struct Peer {
-    sender: broadcast::Sender<Message>,
-    receiver: broadcast::Receiver<Message>,
+pub(crate) struct Peer {
+    pub(crate) sender: broadcast::Sender<Message>,
+    pub(crate) receiver: broadcast::Receiver<Message>,
 }
 
 #[derive(Clone)]
-struct Actor {
+pub(crate) struct Actor {
     id: String,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<String>>>>,
 }
 
 impl Actor {
-    fn new(id: String) -> Self {
+    pub(crate) fn new(id: String) -> Self {
         Actor {
             id,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -55,7 +56,10 @@ impl Actor {
                     match receiver.recv().await {
                         Ok(msg) => Some((peer_id, msg)),
                         Err(e) => {
-                            error!("{} failed to receive message from {}: {}", self.id, peer_id, e);
+                            error!(
+                                "{} failed to receive message from {}: {}",
+                                self.id, peer_id, e
+                            );
                             None
                         }
                     }
@@ -89,7 +93,10 @@ impl Actor {
     }
 
     async fn process_request(&self, msg: Message, sender: String) -> Message {
-        info!("{} processing request from {}: {}", self.id, sender, msg.content);
+        info!(
+            "{} processing request from {}: {}",
+            self.id, sender, msg.content
+        );
         Message {
             id: msg.id,
             content: format!("Response from {}: Processed {}", self.id, msg.content),
@@ -148,12 +155,14 @@ impl Actor {
         }
     }
 
-    async fn connect(&self, peer_id: String, peer: Peer) {
+    pub(crate) async fn connect(&self, peer_id: String, peer: Peer) {
+        info!("{} connecting to peer {}", self.id, peer_id);
         let mut peers = self.peers.write().await;
         peers.insert(peer_id, peer);
     }
 
-    async fn disconnect(&self, peer_id: &str) {
+    pub(crate) async fn disconnect(&self, peer_id: &str) {
+        info!("{} disconnecting from peer {}", self.id, peer_id);
         let mut peers = self.peers.write().await;
         peers.remove(peer_id);
     }
@@ -188,48 +197,4 @@ async fn connect_actors(actor1: &Arc<Actor>, actor2: &Arc<Actor>) {
             },
         )
         .await;
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::new()
-        .filter(None, log::LevelFilter::Info)
-        .parse_env("RUST_LOG")
-        .init();
-
-    let leader = create_actor("Leader".to_string()).await;
-    let follower1 = create_actor("Follower1".to_string()).await;
-    let follower2 = create_actor("Follower2".to_string()).await;
-
-    connect_actors(&leader, &follower1).await;
-    connect_actors(&leader, &follower2).await;
-    connect_actors(&follower1, &follower2).await;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    match leader.send_request("Follower1", "Hello".to_string()).await {
-        Ok(response) => info!("Leader received from Follower1: {}", response),
-        Err(e) => error!("{}", e),
-    }
-
-    match leader.send_request("Follower2", "Hello".to_string()).await {
-        Ok(response) => info!("Leader received from Follower2: {}", response),
-        Err(e) => error!("{}", e),
-    }
-
-    match follower1.send_request("Leader", "Hello".to_string()).await {
-        Ok(response) => info!("Follower1 received from Leader: {}", response),
-        Err(e) => error!("{}", e),
-    }
-
-    follower1.disconnect("Follower2").await;
-    match follower1
-        .send_request("Follower2", "This should fail".to_string())
-        .await
-    {
-        Ok(_) => error!("Unexpected success"),
-        Err(e) => info!("Expected error: {}", e),
-    }
-
-    Ok(())
 }
