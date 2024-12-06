@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,17 +82,18 @@ impl Actor {
     }
     async fn handle_message(&self, peer_id: String, msg: Message) {
         let is_response = self.pending_requests.lock().await.contains_key(&msg.id);
+        trace!("{} is_response: {}", self.id, is_response);
         if is_response {
             info!("{} received response from {}: {:?}", self.id, peer_id, msg);
             self.handle_response(msg).await;
         } else {
             info!("{} received request from {}: {:?}", self.id, peer_id, msg);
-            let response = self.process_request(msg, peer_id.clone()).await;
+            let response = self.handle_request(msg, peer_id.clone()).await;
             self.send_message(peer_id, response).await;
         }
     }
 
-    async fn process_request(&self, msg: Message, sender: String) -> Message {
+    async fn handle_request(&self, msg: Message, sender: String) -> Message {
         info!(
             "{} processing request from {}: {}",
             self.id, sender, msg.content
@@ -156,45 +157,67 @@ impl Actor {
     }
 
     pub(crate) async fn connect(&self, peer_id: String, peer: Peer) {
-        info!("{} connecting to peer {}", self.id, peer_id);
         let mut peers = self.peers.write().await;
-        peers.insert(peer_id, peer);
+        peers.insert(peer_id.clone(), peer);
+        trace!("{} connected to peer {}", self.id, peer_id);
     }
 
     pub(crate) async fn disconnect(&self, peer_id: &str) {
-        info!("{} disconnecting from peer {}", self.id, peer_id);
         let mut peers = self.peers.write().await;
         peers.remove(peer_id);
+        trace!("{} disconnected from peer {}", self.id, peer_id);
     }
 }
 
-async fn create_actor(id: String) -> Arc<Actor> {
-    let actor = Arc::new(Actor::new(id));
-    let actor_clone = actor.clone();
-    tokio::spawn(async move { actor_clone.run().await });
-    actor
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn connect_actors(actor1: &Arc<Actor>, actor2: &Arc<Actor>) {
-    let (tx1, rx1) = broadcast::channel(100);
-    actor1
-        .connect(
-            actor2.id.clone(),
-            Peer {
-                sender: tx1.clone(),
-                receiver: rx1.resubscribe(),
-            },
-        )
-        .await;
+    async fn create_actor(id: String) -> Arc<Actor> {
+        let actor = Arc::new(Actor::new(id));
+        let actor_clone = actor.clone();
+        tokio::spawn(async move { actor_clone.run().await });
+        actor
+    }
 
-    let (tx2, rx2) = broadcast::channel(100);
-    actor2
-        .connect(
-            actor1.id.clone(),
-            Peer {
-                sender: tx2.clone(),
-                receiver: rx2.resubscribe(),
-            },
-        )
-        .await;
+    async fn connect_actors(actor1: &Arc<Actor>, actor2: &Arc<Actor>) {
+        let (tx1, rx1) = broadcast::channel(100);
+        let (tx2, rx2) = broadcast::channel(100);
+        actor1
+            .connect(
+                actor2.id.clone(),
+                Peer {
+                    sender: tx1.clone(),
+                    receiver: rx2.resubscribe(),
+                },
+            )
+            .await;
+
+        actor2
+            .connect(
+                actor1.id.clone(),
+                Peer {
+                    sender: tx2.clone(),
+                    receiver: rx1.resubscribe(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_actor() {
+        env_logger::Builder::new()
+            .filter(None, log::LevelFilter::Trace)
+            .parse_env("RUST_LOG")
+            .init();
+
+        let actor1 = create_actor("actor1".to_string()).await;
+        let actor2 = create_actor("actor2".to_string()).await;
+
+        connect_actors(&actor1, &actor2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let response = actor1.send_request("actor2", "Hello".to_string()).await;
+        assert_eq!(response.unwrap(), "Response from actor2: Processed Hello");
+    }
 }
