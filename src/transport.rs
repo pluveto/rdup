@@ -1,14 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
-use log::info;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, WebSocketStream};
-use url::Url;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::actor::{self, Actor};
 
@@ -28,57 +23,10 @@ impl LeaderActor {
         println!("Leader listening on: {}", addr);
 
         while let Ok((stream, _)) = listener.accept().await {
+            let peer_addr = stream.peer_addr().unwrap().to_string();
             let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
-            self.handle_connection(ws_stream).await;
+            FollowerActor::handle_connection(self.actor.clone(), ws_stream, peer_addr).await;
         }
-    }
-
-    async fn handle_connection(&self, mut ws_stream: WebSocketStream<TcpStream>) {
-        let peer_id = ws_stream.get_ref().peer_addr().unwrap();
-        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-        let (peer_sender, mut peer_receiver) = tokio::sync::broadcast::channel(100);
-
-        self.actor
-            .connect(
-                peer_id.to_string(),
-                actor::Peer {
-                    sender: peer_sender.clone(),
-                    receiver: peer_receiver.resubscribe(),
-                },
-            )
-            .await;
-
-        loop {
-            tokio::select! {
-                msg = ws_receiver.next() => {
-                    match msg {
-                        Some(Ok(msg)) => {
-                            let bin_msg = match msg {
-                                WsMessage::Binary(bin) => bin,
-                                WsMessage::Text(text) => text.as_bytes().to_vec(),
-                                _ => continue,
-                            };
-                            let msg: actor::Message = serde_json::from_slice(&bin_msg).unwrap();
-                            peer_sender.send(msg).unwrap();
-                        }
-                        Some(Err(e)) => {
-                            println!("Error receiving message: {:?}", e);
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-                Ok(msg) = peer_receiver.recv() => {
-                    let bin_msg = serde_json::to_vec(&msg).unwrap();
-                    if let Err(e) = ws_sender.send(WsMessage::Binary(bin_msg)).await {
-                        println!("Error sending message: {:?}", e);
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.actor.disconnect(&peer_id.to_string()).await;
     }
 }
 
@@ -97,12 +45,19 @@ impl FollowerActor {
         println!("Connecting to leader: {}", url);
         let request = url.into_client_request().unwrap();
         let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
+        Self::handle_connection(self.actor.clone(), ws_stream, "leader".to_string()).await;
+    }
 
+    async fn handle_connection<S>(actor: Arc<Actor>, ws_stream: WebSocketStream<S>, peer_id: String)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let (peer_sender, mut peer_receiver) = tokio::sync::broadcast::channel(100);
-        self.actor
+
+        actor
             .connect(
-                "leader".to_string(),
+                peer_id.clone(),
                 actor::Peer {
                     sender: peer_sender.clone(),
                     receiver: peer_receiver.resubscribe(),
@@ -113,36 +68,36 @@ impl FollowerActor {
         loop {
             tokio::select! {
                 msg = ws_receiver.next() => {
-                    match msg {
-                        Some(Ok(msg)) => {
-                            let bin_msg = match msg {
-                                WsMessage::Binary(bin) => bin,
-                                WsMessage::Text(text) => text.as_bytes().to_vec(),
-                                _ => continue,
-                            };
+                    if let Some(Ok(msg)) = msg {
+                        if let Some(bin_msg) = Self::extract_binary_message(msg) {
                             let msg: actor::Message = serde_json::from_slice(&bin_msg).unwrap();
                             peer_sender.send(msg).unwrap();
                         }
-                        Some(Err(e)) => {
-                            println!("Error receiving message: {:?}", e);
-                            break;
-                        }
-                        None => break,
+                    } else {
+                        break;
                     }
                 }
                 Ok(msg) = peer_receiver.recv() => {
                     let bin_msg = serde_json::to_vec(&msg).unwrap();
-                    if let Err(e) = ws_sender.send(WsMessage::Binary(bin_msg)).await {
-                        println!("Error sending message: {:?}", e);
+                    if ws_sender.send(WsMessage::Binary(bin_msg)).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        self.actor.disconnect("leader").await;
+
+        actor.disconnect(&peer_id).await;
+    }
+
+    fn extract_binary_message(msg: WsMessage) -> Option<Vec<u8>> {
+        match msg {
+            WsMessage::Binary(bin) => Some(bin),
+            WsMessage::Text(text) => Some(text.into_bytes()),
+            _ => None,
+        }
     }
 }
-// test
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,14 +109,12 @@ mod tests {
             .parse_env("RUST_LOG")
             .init();
 
-        // Run as leader
         let leader = LeaderActor::new().await;
         let leader_task = tokio::spawn(async move {
             leader.run("127.0.0.1:8080").await;
         });
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        // Or run as regular actor
         let regular = FollowerActor::new().await;
         let regular_task = tokio::spawn(async move {
             regular.connect_to_leader("ws://127.0.0.1:8080").await;
