@@ -1,5 +1,4 @@
 use log::{error, info, trace, warn};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -9,33 +8,28 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Message<T>
-{
+pub struct Message<T> {
     pub id: Uuid,
     pub data: T,
 }
-pub(crate) struct Peer<T>
-{
+pub(crate) struct Peer<T> {
     pub(crate) sender: broadcast::Sender<Message<T>>,
     pub(crate) receiver: broadcast::Receiver<Message<T>>,
 }
 
-pub(crate) struct Actor<T>
-{
+pub(crate) struct Actor<T> {
     id: String,
     peers: Arc<RwLock<HashMap<String, Peer<T>>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<T>>>>,
     request_handler: Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>,
 }
 
-pub(crate) struct ActorBuilder<T>
-{
+pub(crate) struct ActorBuilder<T> {
     id: String,
     request_handler: Option<Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>>,
 }
 
-impl<T> ActorBuilder<T>
-{
+impl<T> ActorBuilder<T> {
     pub(crate) fn new(id: String) -> Self {
         Self {
             id,
@@ -56,11 +50,9 @@ impl<T> ActorBuilder<T>
             id: self.id,
             peers: Arc::new(RwLock::new(HashMap::new())),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            request_handler: self.request_handler.unwrap_or_else(|| {
-                Arc::new(|msg, _| {
-                    msg.data
-                })
-            }),
+            request_handler: self
+                .request_handler
+                .unwrap_or_else(|| Arc::new(|msg, _| msg.data)),
         }
     }
 }
@@ -159,12 +151,14 @@ where
         }
     }
 
-    pub(crate) async fn send_request(
+    pub(crate) async fn send(
         &self,
         target: &str,
         content: T,
+        timeout: Option<Duration>,
     ) -> Result<T, Box<dyn std::error::Error>> {
         let request_id = Uuid::new_v4();
+        info!("{} sending request to {}: {}", self.id, target, request_id);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         {
@@ -179,13 +173,23 @@ where
 
         self.send_message(target.to_string(), request).await;
 
-        match tokio::time::timeout(Duration::from_secs(5), response_rx).await {
-            Ok(Ok(response)) => {
-                info!("{} received response for request {}", self.id, request_id);
-                Ok(response)
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, response_rx).await {
+                Ok(Ok(response)) => {
+                    info!("{} received response for request {}", self.id, request_id);
+                    Ok(response)
+                }
+                Ok(Err(_)) => Err("Response channel closed unexpectedly".into()),
+                Err(_) => Err("Request timed out".into()),
             }
-            Ok(Err(_)) => Err("Response channel closed unexpectedly".into()),
-            Err(_) => Err("Request timed out".into()),
+        } else {
+            match response_rx.await {
+                Ok(response) => {
+                    info!("{} received response for request {}", self.id, request_id);
+                    Ok(response)
+                }
+                Err(_) => Err("Response channel closed unexpectedly".into()),
+            }
         }
     }
 
@@ -208,9 +212,9 @@ mod tests {
 
     async fn create_actor(id: String) -> Arc<Actor<String>> {
         let actor = Arc::new(
-            Actor::builder(id)
-                .with_request_handler(|msg, sender| {
-                    format!("Response from {}: Processed {}", sender, msg.data)
+            Actor::builder(id.clone())
+                .with_request_handler(move |msg, _| {
+                    format!("Response from {}: Processed {}", id, msg.data)
                 })
                 .build(),
         );
@@ -256,7 +260,7 @@ mod tests {
         connect_actors(&actor1, &actor2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let response = actor1.send_request("actor2", "Hello".to_string()).await;
+        let response = actor1.send("actor2", "Hello".to_string(), None).await;
         assert_eq!(response.unwrap(), "Response from actor2: Processed Hello");
     }
 }
