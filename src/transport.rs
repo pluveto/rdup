@@ -1,9 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
+use log::{info, trace};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, WebSocketStream};
@@ -33,19 +35,23 @@ where
         }
     }
 
-    pub async fn run(&self, addr: &str) {
+    pub async fn run(&self, addr: &str, ready_notify: Arc<Notify>) {
         let listener = TcpListener::bind(addr).await.unwrap();
-        println!("Leader listening on: {}", addr);
+        info!("Leader listening on: {}", addr);
 
         let actor_clone = self.actor.clone();
         tokio::spawn(async move {
             actor_clone.run().await;
         });
 
+        ready_notify.notify_one();
+        info!("Leader ready");
+
         while let Ok((stream, _)) = listener.accept().await {
             let peer_addr = stream.peer_addr().unwrap().to_string();
+            trace!("New connection from: {}", peer_addr);
             let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
-            FollowerActor::on_connected(self.actor.clone(), ws_stream, peer_addr).await;
+            FollowerActor::on_connected(self.actor.clone(), ws_stream, peer_addr, None).await;
         }
     }
 }
@@ -71,15 +77,25 @@ where
         }
     }
 
-    pub async fn follow(&self, url: &str) {
+    pub async fn follow(&self, url: &str, connected_notify: Arc<Notify>) {
         println!("Connecting to leader: {}", url);
         let request = url.into_client_request().unwrap();
         let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
-        Self::on_connected(self.actor.clone(), ws_stream, "leader".to_string()).await;
+        Self::on_connected(
+            self.actor.clone(),
+            ws_stream,
+            "leader".to_string(),
+            Some(connected_notify),
+        )
+        .await;
     }
 
-    async fn on_connected<S>(actor: Arc<Actor<T>>, ws_stream: WebSocketStream<S>, peer_id: String)
-    where
+    async fn on_connected<S>(
+        actor: Arc<Actor<T>>,
+        ws_stream: WebSocketStream<S>,
+        peer_id: String,
+        connected_notify: Option<Arc<Notify>>,
+    ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -95,6 +111,11 @@ where
                 },
             )
             .await;
+
+        if let Some(connected_notify) = connected_notify {
+            connected_notify.notify_one();
+        }
+
         loop {
             tokio::select! {
                 msg = ws_source.next() => {
@@ -133,7 +154,6 @@ mod tests {
     use log::debug;
 
     use super::*;
-    use std::env;
 
     #[tokio::test]
     async fn test_leader() {
@@ -141,11 +161,16 @@ mod tests {
 
         debug!("Starting test_leader");
         let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
+        let leader_ready = Arc::new(Notify::new());
+        let leader_ready_cloned = leader_ready.clone();
         let leader_task = tokio::spawn(async move {
-            leader.run("127.0.0.1:8080").await;
+            leader.run("127.0.0.1:8080", leader_ready).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        debug!("Waiting for leader to be ready");
+        leader_ready_cloned.notified().await;
+        debug!("Leader is ready");
+
         let regular =
             FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
         let regular_cloned = regular.clone();
@@ -153,11 +178,17 @@ mod tests {
             regular_cloned.actor.run().await;
         });
         let regular_cloned = regular.clone();
+        let connected_notify = Arc::new(Notify::new());
+        let connected_notify_cloned = connected_notify.clone();
         let regular_follow_task = tokio::spawn(async move {
-            regular_cloned.follow("ws://127.0.0.1:8080").await;
+            regular_cloned
+                .follow("ws://127.0.0.1:8080", connected_notify)
+                .await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        connected_notify_cloned.notified().await;
         regular
             .actor
             .send("leader", "Hello".to_string(), None)
