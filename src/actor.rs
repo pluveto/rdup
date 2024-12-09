@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -27,6 +27,8 @@ pub(crate) struct Actor<T> {
     peers: Arc<RwLock<HashMap<String, Peer<T>>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<T>>>>,
     request_handler: Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>,
+    stop_tx: watch::Sender<()>,
+    stopped_notify: Arc<Notify>,
 }
 
 pub(crate) struct ActorBuilder<T> {
@@ -58,6 +60,8 @@ impl<T> ActorBuilder<T> {
             request_handler: self
                 .request_handler
                 .unwrap_or_else(|| Arc::new(|msg, _| msg.data)),
+            stop_tx: watch::channel(()).0,
+            stopped_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -70,7 +74,9 @@ where
         ActorBuilder::new(id)
     }
 
-    pub(crate) async fn run(&self) {
+    pub(crate) async fn start(&self) {
+        let mut stop_rx = self.stop_tx.subscribe();
+
         info!("Actor {} started", self.id);
         loop {
             let mut peer_receivers = Vec::new();
@@ -109,12 +115,24 @@ where
                             self.handle_message(peer_id, msg).await;
                         }
                         None => {
-                            warn!("Received None from a peer, continuing...");
+                            warn!("{} failed to receive message from any peer", self.id);
                         }
                     }
                 }
+                _ = stop_rx.changed() => {
+                    info!("{} received stop signal", self.id);
+                    break;
+                }
             }
         }
+
+        self.stopped_notify.notify_one();
+    }
+
+    pub(crate) async fn stop(&self) {
+        let _ = self.stop_tx.send(());
+        self.stopped_notify.notified().await;
+        info!("{} stopped", self.id);
     }
 
     pub(crate) async fn handle_message(&self, peer_id: String, msg: Message<T>) {
@@ -215,12 +233,20 @@ where
 
     pub(crate) async fn connect(&self, peer_id: String, peer: Peer<T>) {
         let mut peers = self.peers.write().await;
+        if peers.contains_key(&peer_id) {
+            error!("{} already connected to peer {}", self.id, peer_id);
+            return;
+        }
         peers.insert(peer_id.clone(), peer);
         trace!("{} connected to peer {}", self.id, peer_id);
     }
 
     pub(crate) async fn disconnect(&self, peer_id: &str) {
         let mut peers = self.peers.write().await;
+        if !peers.contains_key(peer_id) {
+            error!("{} not connected to peer {}", self.id, peer_id);
+            return;
+        }
         peers.remove(peer_id);
         trace!("{} disconnected from peer {}", self.id, peer_id);
     }
@@ -239,7 +265,7 @@ mod tests {
                 .build(),
         );
         let actor_clone = actor.clone();
-        tokio::spawn(async move { actor_clone.run().await });
+        tokio::spawn(async move { actor_clone.start().await });
         actor
     }
 
@@ -269,9 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor() {
-        let _ = env_logger::Builder::new()
-            .parse_env("RUST_LOG")
-            .try_init();
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
 
         let actor1 = create_actor("actor1".to_string()).await;
         let actor2 = create_actor("actor2".to_string()).await;
