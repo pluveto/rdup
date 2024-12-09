@@ -12,8 +12,13 @@ pub struct Message<T> {
     pub id: Uuid,
     pub data: T,
 }
+
+/// Ports for communication between actors
+/// NOTE: never use two ends of a channel as peer params to communicate
 pub(crate) struct Peer<T> {
+    /// Sender for messages to other peers
     pub(crate) sender: broadcast::Sender<Message<T>>,
+    /// Receiver for messages from other peers
     pub(crate) receiver: broadcast::Receiver<Message<T>>,
 }
 
@@ -112,7 +117,7 @@ where
         }
     }
 
-    async fn handle_message(&self, peer_id: String, msg: Message<T>) {
+    pub(crate) async fn handle_message(&self, peer_id: String, msg: Message<T>) {
         let is_response = self.pending_requests.lock().await.contains_key(&msg.id);
         trace!("{} is_response: {}", self.id, is_response);
         if is_response {
@@ -157,6 +162,21 @@ where
         content: T,
         timeout: Option<Duration>,
     ) -> Result<T, Box<dyn std::error::Error>> {
+        // check validity of target
+        if target.is_empty() {
+            return Err("Invalid target".into());
+        }
+        {
+            let peers = self.peers.read().await;
+            if !peers.contains_key(target) {
+                // debug all peers
+                for (peer_id, _) in peers.iter() {
+                    println!("{} has peer: {}", self.id, peer_id);
+                }
+                return Err(format!("{} is not connected to {}", self.id, target).into());
+            }
+        }
+
         let request_id = Uuid::new_v4();
         info!("{} sending request to {}: {}", self.id, target, request_id);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -249,10 +269,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_actor() {
-        env_logger::Builder::new()
-            .filter(None, log::LevelFilter::Trace)
+        let _ = env_logger::Builder::new()
             .parse_env("RUST_LOG")
-            .init();
+            .try_init();
 
         let actor1 = create_actor("actor1".to_string()).await;
         let actor2 = create_actor("actor2".to_string()).await;
