@@ -1,11 +1,14 @@
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use log::{error, info, trace, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -18,6 +21,7 @@ pub enum ActorError {
     PeerNotConnected(String),
     RequestTimeout,
     ResponseChannelClosed,
+    UnknowError(String),
 }
 
 impl Error for ActorError {}
@@ -31,6 +35,7 @@ impl Display for ActorError {
             ActorError::PeerNotConnected(peer_id) => write!(f, "Peer not connected: {}", peer_id),
             ActorError::RequestTimeout => write!(f, "Request timeout"),
             ActorError::ResponseChannelClosed => write!(f, "Response channel closed"),
+            ActorError::UnknowError(e) => write!(f, "Unknow error: {}", e),
         }
     }
 }
@@ -70,9 +75,12 @@ struct ActorInner<T> {
     peers: Arc<RwLock<HashMap<String, Peer<T>>>>,
     pending_requests: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<T>>>>,
     request_handler: Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>,
+    // notify when the actor should stop
     stop_tx: watch::Sender<()>,
     stopped_notify: Arc<Notify>,
     is_running: AtomicBool,
+    // notify when a new peer is added or removed
+    peer_tx: watch::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -113,6 +121,7 @@ impl<T> ActorBuilder<T> {
                 stop_tx: watch::channel(()).0,
                 stopped_notify: Arc::new(Notify::new()),
                 is_running: AtomicBool::new(false),
+                peer_tx: watch::channel(()).0,
             }),
         }
     }
@@ -134,9 +143,14 @@ where
     pub async fn start(&self) -> Result<JoinHandle<()>, ActorError> {
         if !self.is_running().await {
             let actor = self.clone();
-            Ok(tokio::spawn(async move {
-                actor.inner.run().await;
-            }))
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                actor.inner.run(Some(ready_tx)).await;
+            });
+            if let Err(e) = ready_rx.await {
+                return Err(ActorError::UnknowError(e.to_string()));
+            }
+            Ok(handle)
         } else {
             Err(ActorError::ActorRunning)
         }
@@ -187,51 +201,49 @@ impl<T> ActorInner<T>
 where
     T: Clone + Debug + Send + Sync + 'static,
 {
-    async fn run(&self) {
+    async fn run(&self, ready_tx: Option<oneshot::Sender<()>>) {
         let mut stop_rx = self.stop_tx.subscribe();
+        let mut peers_rx = self.peer_tx.subscribe();
 
         info!("{}: actor started", self.id);
         self.is_running.store(true, Ordering::SeqCst);
 
+        let mut peer_receivers = HashMap::new();
+        let mut active_peers = HashSet::new();
+
+        if let Some(tx) = ready_tx {
+            let _ = tx.send(());
+        }
         loop {
-            let mut peer_receivers = Vec::new();
-            {
-                let peers = self.peers.read().await;
-                for (peer_id, peer) in peers.iter() {
-                    peer_receivers.push((peer_id.clone(), peer.receiver.resubscribe()));
+            let peers = self.peers.read().await;
+            if peers.is_empty() {
+                drop(peers);
+                tokio::select! {
+                    _ = peers_rx.changed() => {
+                        continue;
+                    }
+                    _ = stop_rx.changed() => {
+                        info!("{}: received stop signal", self.id);
+                        break;
+                    }
                 }
             }
 
-            if peer_receivers.is_empty() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            let current_peers: HashSet<_> = peers.keys().cloned().collect();
 
-            let mut select_futures = Vec::new();
-            for (peer_id, mut receiver) in peer_receivers {
-                select_futures.push(Box::pin(async move {
-                    match receiver.recv().await {
-                        Ok(msg) => Some((peer_id, msg)),
-                        Err(e) => {
-                            error!(
-                                "{}: failed to receive message from {}: {}",
-                                self.id, peer_id, e
-                            );
-                            None
-                        }
-                    }
-                }));
-            }
+            Self::update_peer_receivers(&mut peer_receivers, &peers, &current_peers, &active_peers);
+            drop(peers);
+
+            active_peers = current_peers;
+
+            let mut select_futures = Self::create_futures(&mut peer_receivers);
 
             tokio::select! {
-                result = futures_util::future::select_all(select_futures) => {
-                    match result.0 {
-                        Some((peer_id, msg)) => {
-                            self.handle_message(peer_id, msg).await;
-                        }
-                        None => {
-                            warn!("{}: failed to receive message from any peer", self.id);
-                        }
+                Some(result) = select_futures.next() => {
+                    if let Some((peer_id, msg)) = result {
+                        self.handle_message(peer_id, msg).await;
+                    } else {
+                        warn!("{}: failed to receive message from any peer", self.id);
                     }
                 }
                 _ = stop_rx.changed() => {
@@ -242,6 +254,50 @@ where
         }
 
         self.stopped_notify.notify_one();
+    }
+
+    // Update peer receivers. By this:
+    // peer_receivers = peer_receivers - removed_peers + new_peers
+    //    where removed_peers = active_peers - current_peers
+    //    where new_peers = current_peers - active_peers
+    fn update_peer_receivers(
+        peer_receivers: &mut HashMap<String, broadcast::Receiver<Message<T>>>,
+        peers: &HashMap<String, Peer<T>>,
+        current_peers: &HashSet<String>,
+        active_peers: &HashSet<String>,
+    ) {
+        let new_peers = current_peers.difference(active_peers);
+        let removed_peers = active_peers.difference(current_peers);
+
+        for peer_id in new_peers {
+            if let Some(peer) = peers.get(peer_id) {
+                peer_receivers.insert(peer_id.clone(), peer.receiver.resubscribe());
+            }
+        }
+
+        for peer_id in removed_peers {
+            peer_receivers.remove(peer_id);
+        }
+    }
+
+    fn create_futures<'a>(
+        peer_receivers: &'a mut HashMap<String, broadcast::Receiver<Message<T>>>,
+    ) -> FuturesUnordered<impl Future<Output = Option<(String, Message<T>)>> + 'a> {
+        peer_receivers
+            .iter_mut()
+            .map(|(peer_id, receiver)| {
+                let peer_id = peer_id.clone();
+                Box::pin(async move {
+                    match receiver.recv().await {
+                        Ok(msg) => Some((peer_id, msg)),
+                        Err(e) => {
+                            error!("Failed to receive message from {}: {}", peer_id, e);
+                            None
+                        }
+                    }
+                })
+            })
+            .collect()
     }
 
     pub async fn stop(&self) -> bool {
@@ -283,14 +339,16 @@ where
 
     async fn send_message(&self, target: String, message: Message<T>) {
         info!("{}: sending message to {}: {:?}", self.id, target, message);
-        let peers = self.peers.read().await;
-        if let Some(peer) = peers.get(&target) {
-            match peer.sender.send(message) {
-                Ok(_) => info!("{}: sent message to {}", self.id, target),
-                Err(e) => error!("{}: failed to send message to {}: {:?}", self.id, target, e),
+        {
+            let peers = self.peers.read().await;
+            if let Some(peer) = peers.get(&target) {
+                match peer.sender.send(message) {
+                    Ok(_) => info!("{}: sent message to {}", self.id, target),
+                    Err(e) => error!("{}: failed to send message to {}: {:?}", self.id, target, e),
+                }
+            } else {
+                error!("{}: couldn't find peer {}", self.id, target);
             }
-        } else {
-            error!("{}: couldn't find peer {}", self.id, target);
         }
     }
 
@@ -352,24 +410,29 @@ where
 
     /// Connect to another actor logically (no need to be running)
     pub(crate) async fn connect(&self, peer_id: String, peer: Peer<T>) -> Result<bool, ActorError> {
-        let mut peers = self.peers.write().await;
-        if peers.contains_key(&peer_id) {
-            trace!("{}: already connected to peer {}", self.id, peer_id);
-            return Ok(false);
+        {
+            let mut peers = self.peers.write().await;
+            if peers.contains_key(&peer_id) {
+                trace!("{}: already connected to peer {}", self.id, peer_id);
+                return Ok(false);
+            }
+            peers.insert(peer_id.clone(), peer);
         }
-        peers.insert(peer_id.clone(), peer);
+        let _ = self.peer_tx.send(()); // may not runned yet, but it's ok
         trace!("{}: connected to peer {}", self.id, peer_id);
         Ok(true)
     }
 
     /// Disconnect from another actor logically (no need to be running)
     pub(crate) async fn disconnect(&self, peer_id: &str) -> Result<bool, ActorError> {
-        let mut peers = self.peers.write().await;
-        if !peers.contains_key(peer_id) {
-            trace!("{}: not connected to peer {}", self.id, peer_id);
-            return Ok(false);
+        {
+            let mut peers = self.peers.write().await;
+            if !peers.contains_key(peer_id) {
+                trace!("{}: not connected to peer {}", self.id, peer_id);
+                return Ok(false);
+            }
+            peers.remove(peer_id);
         }
-        peers.remove(peer_id);
         trace!("{}: disconnected from peer {}", self.id, peer_id);
         Ok(true)
     }
@@ -415,6 +478,7 @@ mod tests {
             )
             .await
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     #[tokio::test]
@@ -425,9 +489,64 @@ mod tests {
         let actor2 = create_actor("actor2".to_string()).await;
 
         connect_actors(&actor1, &actor2).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let response = actor1.send("actor2", "Hello".to_string(), None).await;
         assert_eq!(response.unwrap(), "Response from actor2: Processed Hello");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_message_exchange() {
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+
+        let actor1 = create_actor("actor1".to_string()).await;
+        let actor2 = create_actor("actor2".to_string()).await;
+
+        connect_actors(&actor1, &actor2).await;
+
+        let messages = vec!["Hello", "How are you?", "Goodbye"];
+        for message in messages {
+            let response = actor1.send("actor2", message.to_string(), None).await;
+            assert_eq!(
+                response.unwrap(),
+                format!("Response from actor2: Processed {}", message)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_three_actors_send_to_one() {
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+
+        let main_actor = create_actor("main_actor".to_string()).await;
+        let actor1 = create_actor("actor1".to_string()).await;
+        let actor2 = create_actor("actor2".to_string()).await;
+        let actor3 = create_actor("actor3".to_string()).await;
+
+        connect_actors(&actor1, &main_actor).await;
+        connect_actors(&actor2, &main_actor).await;
+        connect_actors(&actor3, &main_actor).await;
+
+        let response1 = actor1
+            .send("main_actor", "Message from actor1".to_string(), None)
+            .await;
+        let response2 = actor2
+            .send("main_actor", "Message from actor2".to_string(), None)
+            .await;
+        let response3 = actor3
+            .send("main_actor", "Message from actor3".to_string(), None)
+            .await;
+
+        assert_eq!(
+            response1.unwrap(),
+            "Response from main_actor: Processed Message from actor1"
+        );
+        assert_eq!(
+            response2.unwrap(),
+            "Response from main_actor: Processed Message from actor2"
+        );
+        assert_eq!(
+            response3.unwrap(),
+            "Response from main_actor: Processed Message from actor3"
+        );
     }
 }
