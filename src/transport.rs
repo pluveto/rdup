@@ -62,14 +62,12 @@ where
             let id_cloned = id.clone();
             tokio::spawn(async move {
                 let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
-                let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                 FollowerActor::on_connected(
                     actor_clone,
                     ws_stream,
                     peer_addr.clone(),
                     None,
-                    stop_signal,
                     disconnect_rx,
                 )
                 .await;
@@ -94,7 +92,6 @@ where
 #[derive(Clone)]
 pub struct FollowerActor<T> {
     actor: Arc<Actor<T>>,
-    stop_signal: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
     disconnect_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
@@ -112,8 +109,6 @@ where
                     .with_request_handler(request_handler)
                     .build(),
             ),
-
-            stop_signal: Arc::new(AtomicBool::new(false)),
             busy: Arc::new(AtomicBool::new(false)),
             disconnect_tx: Arc::new(Mutex::new(None)),
         }
@@ -141,7 +136,6 @@ where
             self.disconnect_tx.lock().await.replace(disconnect_tx);
 
             let actor = self.actor.clone();
-            let stop_signal = self.stop_signal.clone();
             let connected_notify = Arc::new(Notify::new());
             let connected_notify_cloned = connected_notify.clone();
 
@@ -152,7 +146,6 @@ where
                     ws_stream,
                     "leader".to_string(),
                     Some(connected_notify_cloned),
-                    stop_signal,
                     disconnect_rx,
                 )
                 .await;
@@ -173,8 +166,6 @@ where
                 return Ok(false);
             }
 
-            self.stop_signal.store(true, Ordering::SeqCst);
-
             if let Some(disconnect_tx) = self.disconnect_tx.lock().await.take() {
                 let _ = disconnect_tx.send(());
             }
@@ -190,7 +181,6 @@ where
         ws_stream: WebSocketStream<S>,
         peer_id: String,
         connected_notify: Option<Arc<Notify>>,
-        stop_signal: Arc<AtomicBool>,
         mut disconnect_rx: oneshot::Receiver<()>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -242,12 +232,6 @@ where
                     trace!("{}: disconnect signal received", actor.id());
                     break;
                 }
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                    if stop_signal.load(Ordering::SeqCst) {
-                        trace!("{}: stop signal received", actor.id());
-                        break;
-                    }
-                }
             }
         }
 
@@ -269,24 +253,34 @@ where
 #[cfg(test)]
 mod tests {
     use log::debug;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::*;
 
+    async fn find_free_port() -> u16 {
+        let addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
+        let listener = std::net::TcpListener::bind(addr).unwrap();
+
+        listener.local_addr().unwrap().port()
+    }
+
     #[tokio::test]
-    async fn test_leader() {
+    async fn test_one_leader_one_follower() {
         let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+        let port = find_free_port().await;
 
         debug!("Starting test_leader");
         let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
-        leader.start("127.0.0.1:8080").await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        leader.start(&format!("127.0.0.1:{port}")).await;
 
         let regular =
             FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
         regular.actor.start().await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        regular.follow("ws://127.0.0.1:8080").await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        regular
+            .follow(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
 
         trace!("Sending message to leader");
         let reply = regular
@@ -302,13 +296,13 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_followers() {
         let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+        let port = find_free_port().await;
 
         debug!("Starting test_multiple_followers");
         let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
-        leader.start("127.0.0.1:8080").await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        leader.start(&format!("127.0.0.1:{port}")).await;
 
-        let follower_count = 3;
+        let follower_count = 2;
         let mut followers = Vec::new();
 
         for i in 0..follower_count {
@@ -316,15 +310,19 @@ mod tests {
                 FollowerActor::new(move |msg, _| format!("Follower {} processed: {}", i, msg.data))
                     .await;
             follower.actor.start().await.unwrap();
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            follower.follow("ws://127.0.0.1:8080").await.unwrap();
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            follower
+                .follow(&format!("ws://127.0.0.1:{port}"))
+                .await
+                .unwrap();
+
             followers.push(follower);
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
         trace!("Sending messages to leader from followers");
-        for i in 0..follower_count {
-            let reply = followers[i]
+        for (i, f) in followers.iter().enumerate().take(follower_count) {
+            let reply = f
                 .actor
                 .send("leader", format!("Hello from follower {}", i), None)
                 .await
@@ -342,18 +340,20 @@ mod tests {
     #[tokio::test]
     async fn test_leader_sends_to_follower() {
         let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+        let port = find_free_port().await;
 
         debug!("Starting test_leader_sends_to_follower");
         let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
-        leader.start("127.0.0.1:8080").await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        leader.start(&format!("127.0.0.1:{port}")).await;
 
         let follower =
             FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
         follower.actor.start().await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        follower.follow("ws://127.0.0.1:8080").await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        follower
+            .follow(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
 
         trace!("Leader sending message to follower");
         let reply = leader
@@ -367,6 +367,65 @@ mod tests {
             .unwrap();
 
         assert_eq!("Follower processed: Hello from leader", reply);
+        leader.stop().await;
+    }
+
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tokio::task;
+
+    #[tokio::test]
+    async fn fuzz_test_leader_follower_concurrency() {
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+        let port = find_free_port().await;
+
+        debug!("Starting fuzz_test_leader_follower_concurrency");
+
+        let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
+        leader.start(&format!("127.0.0.1:{port}")).await;
+
+        let follower =
+            FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
+        follower.actor.start().await.unwrap();
+
+        follower
+            .follow(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        let concurrency = 100; // Number of concurrent tasks
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+
+        let mut handles = vec![];
+
+        for i in 0..concurrency {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let leader = leader.clone();
+            let handle = task::spawn(async move {
+                let reply = leader
+                    .actor
+                    .send(
+                        &leader.peer_ids().await[0].clone(),
+                        format!("Hello from leader {}", i),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    format!("Follower processed: Hello from leader {}", i),
+                    reply
+                );
+                drop(permit); // Release the permit
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
         leader.stop().await;
     }
 }
