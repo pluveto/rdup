@@ -37,24 +37,25 @@ where
         }
     }
 
-    pub async fn start(&self, addr: &str, ready_notify: Arc<Notify>) {
+    pub async fn start(&self, addr: &str) {
         let listener = TcpListener::bind(addr).await.unwrap();
-        info!("Leader listening on: {}", addr);
 
-        let actor_clone = self.actor.clone();
-        tokio::spawn(async move {
-            actor_clone.start().await;
-        });
+        self.actor.start().await.expect("Failed to start actor");
+        let self_clone = self.clone();
+        tokio::spawn(async move { self_clone.run_listener(listener).await });
+        info!("{}: started", self.actor.id());
+    }
 
-        ready_notify.notify_one();
-        info!("Leader ready");
-
+    async fn run_listener(self, listener: TcpListener) {
+        let id = self.actor.id();
+        info!("{}: listening on: {}", self.actor.id(), listener.local_addr().unwrap());
         while let Ok((stream, _)) = listener.accept().await {
             let peer_addr = stream.peer_addr().unwrap().to_string();
-            trace!("New connection from: {}", peer_addr);
+            trace!("{}: new connection from: {}", id, peer_addr);
             let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
             let actor_clone = self.actor.clone();
 
+            let id_cloned = id.clone();
             tokio::spawn(async move {
                 let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
                 let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -69,7 +70,7 @@ where
                 )
                 .await;
 
-                warn!("Follower disconnected: {}", peer_addr);
+                warn!("{}: Follower disconnected: {}", id_cloned, peer_addr);
                 disconnect_tx
                     .send(())
                     .expect("Failed to send disconnect signal");
@@ -86,6 +87,7 @@ where
 pub struct FollowerActor<T> {
     actor: Arc<Actor<T>>,
     stop_signal: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
     disconnect_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -104,35 +106,75 @@ where
             ),
 
             stop_signal: Arc::new(AtomicBool::new(false)),
+            busy: Arc::new(AtomicBool::new(false)),
             disconnect_tx: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn follow(&self, url: &str, connected_notify: Arc<Notify>) {
-        println!("Connecting to leader: {}", url);
-        let request = url.into_client_request().unwrap();
-        let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
-        let (disconnect_tx, disconnect_rx) = oneshot::channel();
-        self.disconnect_tx.lock().await.replace(disconnect_tx);
-
-        Self::on_connected(
-            self.actor.clone(),
-            ws_stream,
-            "leader".to_string(),
-            Some(connected_notify),
-            self.stop_signal.clone(),
-            disconnect_rx,
-        )
-        .await;
+    pub async fn is_connected(&self) -> bool {
+        self.actor.is_connected("leader").await
     }
-    pub async fn unfollow(&self) {
-        self.stop_signal.store(true, Ordering::SeqCst);
 
-        if let Some(disconnect_tx) = self.disconnect_tx.lock().await.take() {
-            let _ = disconnect_tx.send(());
+    pub async fn follow(&self, url: &str) -> Result<bool, anyhow::Error> {
+        if self.busy.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Actor is busy"));
         }
+        self.busy.store(true, Ordering::SeqCst);
+        {
+            if self.is_connected().await {
+                return Ok(false);
+            }
 
-        self.actor.disconnect("leader").await;
+            trace!("{}: connecting to leader: {}", self.actor.id(), url);
+            let request = url.into_client_request().unwrap();
+            let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
+            let (disconnect_tx, disconnect_rx) = oneshot::channel();
+            assert!(self.disconnect_tx.lock().await.is_none());
+            self.disconnect_tx.lock().await.replace(disconnect_tx);
+
+            let actor = self.actor.clone();
+            let stop_signal = self.stop_signal.clone();
+            let connected_notify = Arc::new(Notify::new());
+            let connected_notify_cloned = connected_notify.clone();
+
+            trace!("{}: waiting ws stream", self.actor.id());
+            tokio::spawn(async move {
+                Self::on_connected(
+                    actor,
+                    ws_stream,
+                    "leader".to_string(),
+                    Some(connected_notify_cloned),
+                    stop_signal,
+                    disconnect_rx,
+                )
+                .await;
+            });
+            connected_notify.notified().await;
+        }
+        self.busy.store(false, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    pub async fn unfollow(&self) -> Result<bool, anyhow::Error> {
+        if self.busy.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Actor is busy"));
+        }
+        self.busy.store(true, Ordering::SeqCst);
+        {
+            if !self.is_connected().await {
+                return Ok(false);
+            }
+
+            self.stop_signal.store(true, Ordering::SeqCst);
+
+            if let Some(disconnect_tx) = self.disconnect_tx.lock().await.take() {
+                let _ = disconnect_tx.send(());
+            }
+
+            self.actor.disconnect("leader").await.unwrap();
+        }
+        self.busy.store(false, Ordering::SeqCst);
+        Ok(true)
     }
 
     async fn on_connected<S>(
@@ -145,7 +187,9 @@ where
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        trace!("{}: on_connected", actor.id());
         let (mut ws_sink, mut ws_source) = ws_stream.split();
+
         let (peer_source_tx, peer_source_rx) = tokio::sync::broadcast::channel(100);
         let (peer_sink_tx, mut peer_sink_rx) = tokio::sync::broadcast::channel(100);
 
@@ -157,12 +201,14 @@ where
                     receiver: peer_source_rx.resubscribe(),
                 },
             )
-            .await;
+            .await
+            .unwrap();
 
         if let Some(connected_notify) = connected_notify {
             connected_notify.notify_one();
         }
 
+        trace!("{}: stream connected to leader: {}", actor.id(), peer_id);
         loop {
             tokio::select! {
                 msg = ws_source.next() => {
@@ -172,7 +218,7 @@ where
                             peer_source_tx.send(msg).unwrap();
                         }
                     } else {
-                        trace!("Websocket connection closed: {:?}", msg);
+                        trace!("{}: websocket connection closed from {}", actor.id(), peer_id);
                         break;
                     }
                 }
@@ -180,17 +226,17 @@ where
                     let bin_msg = serde_json::to_vec(&msg).unwrap();
                     let ret = ws_sink.send(WsMessage::Binary(bin_msg)).await;
                     if ret.is_err() {
-                        trace!("Failed to send message to peer: {}", ret.unwrap_err());
+                        trace!("{}: failed to send message to {}", actor.id(), peer_id);
                         break;
                     }
                 }
                 _ = &mut disconnect_rx => {
-                    trace!("Disconnect signal received");
+                    trace!("{}: disconnect signal received", actor.id());
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                     if stop_signal.load(Ordering::SeqCst) {
-                        trace!("Stop signal received");
+                        trace!("{}: stop signal received", actor.id());
                         break;
                     }
                 }
@@ -200,7 +246,7 @@ where
         // Close the WebSocket connection
         let _ = ws_sink.close().await;
 
-        actor.disconnect(&peer_id).await;
+        actor.disconnect(&peer_id).await.unwrap();
     }
 
     fn extract_binary_message(msg: WsMessage) -> Option<Vec<u8>> {
@@ -224,38 +270,15 @@ mod tests {
 
         debug!("Starting test_leader");
         let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
-        {
-            let leader_ready = Arc::new(Notify::new());
-            let leader_ready_cloned = leader_ready.clone();
-            let leader_cloned = leader.clone();
-            let _ = tokio::spawn(async move {
-                leader_cloned.start("127.0.0.1:8080", leader_ready).await;
-            });
+        leader.start("127.0.0.1:8080").await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-            debug!("Waiting for leader to be ready");
-            leader_ready_cloned.notified().await;
-            debug!("Leader is ready");
-        }
         let regular =
             FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
-        {
-            let regular_cloned = regular.clone();
-            let _ = tokio::spawn(async move {
-                regular_cloned.actor.start().await;
-            });
-            let regular_cloned = regular.clone();
-            let connected_notify = Arc::new(Notify::new());
-            let connected_notify_cloned = connected_notify.clone();
-            let _ = tokio::spawn(async move {
-                regular_cloned
-                    .follow("ws://127.0.0.1:8080", connected_notify)
-                    .await;
-            });
-
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-            connected_notify_cloned.notified().await;
-        }
+        regular.actor.start().await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        regular.follow("ws://127.0.0.1:8080").await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         trace!("Sending message to leader");
         let reply = regular
@@ -265,7 +288,6 @@ mod tests {
             .unwrap();
 
         assert_eq!("Leader processed: Hello", reply);
-
         leader.stop().await;
     }
 }
