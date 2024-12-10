@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, WebSocketStream};
@@ -58,7 +58,6 @@ where
             trace!("{}: new connection from: {}", id, peer_addr);
             let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
             let actor_clone = self.actor.clone();
-            let (_, stop_rx) = watch::channel(());
 
             let id_cloned = id.clone();
             tokio::spawn(async move {
@@ -69,7 +68,6 @@ where
                     ws_stream,
                     peer_addr.clone(),
                     None,
-                    stop_rx,
                     disconnect_rx,
                 )
                 .await;
@@ -94,7 +92,6 @@ where
 #[derive(Clone)]
 pub struct FollowerActor<T> {
     actor: Arc<Actor<T>>,
-    stop_tx: watch::Sender<()>,
     busy: Arc<AtomicBool>,
     disconnect_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
@@ -112,8 +109,6 @@ where
                     .with_request_handler(request_handler)
                     .build(),
             ),
-
-            stop_tx: watch::channel(()).0,
             busy: Arc::new(AtomicBool::new(false)),
             disconnect_tx: Arc::new(Mutex::new(None)),
         }
@@ -141,7 +136,6 @@ where
             self.disconnect_tx.lock().await.replace(disconnect_tx);
 
             let actor = self.actor.clone();
-            let stop_rx = self.stop_tx.subscribe();
             let connected_notify = Arc::new(Notify::new());
             let connected_notify_cloned = connected_notify.clone();
 
@@ -152,7 +146,6 @@ where
                     ws_stream,
                     "leader".to_string(),
                     Some(connected_notify_cloned),
-                    stop_rx,
                     disconnect_rx,
                 )
                 .await;
@@ -188,7 +181,6 @@ where
         ws_stream: WebSocketStream<S>,
         peer_id: String,
         connected_notify: Option<Arc<Notify>>,
-        mut stop_rx: watch::Receiver<()>,
         mut disconnect_rx: oneshot::Receiver<()>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -262,15 +254,14 @@ where
 mod tests {
     use log::debug;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::Duration;
 
     use super::*;
 
     async fn find_free_port() -> u16 {
         let addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
         let listener = std::net::TcpListener::bind(addr).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        port
+
+        listener.local_addr().unwrap().port()
     }
 
     #[tokio::test]
@@ -330,8 +321,8 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
         trace!("Sending messages to leader from followers");
-        for i in 0..follower_count {
-            let reply = followers[i]
+        for (i, f) in followers.iter().enumerate().take(follower_count) {
+            let reply = f
                 .actor
                 .send("leader", format!("Hello from follower {}", i), None)
                 .await

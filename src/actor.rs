@@ -88,9 +88,11 @@ pub struct Actor<T> {
     inner: Arc<ActorInner<T>>,
 }
 
+type ActorRequestHandler<T> = Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>;
+
 pub struct ActorBuilder<T> {
     id: String,
-    request_handler: Option<Arc<dyn Fn(Message<T>, String) -> T + Send + Sync>>,
+    request_handler: Option<ActorRequestHandler<T>>,
 }
 
 impl<T> ActorBuilder<T> {
@@ -280,9 +282,9 @@ where
         }
     }
 
-    fn create_futures<'a>(
-        peer_receivers: &'a mut HashMap<String, broadcast::Receiver<Message<T>>>,
-    ) -> FuturesUnordered<impl Future<Output = Option<(String, Message<T>)>> + 'a> {
+    fn create_futures(
+        peer_receivers: &mut HashMap<String, broadcast::Receiver<Message<T>>>,
+    ) -> FuturesUnordered<impl Future<Output = Option<(String, Message<T>)>> + '_> {
         peer_receivers
             .iter_mut()
             .map(|(peer_id, receiver)| {
