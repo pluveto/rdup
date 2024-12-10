@@ -126,6 +126,11 @@ where
         ActorBuilder::new(id)
     }
 
+    pub async fn peer_ids(&self) -> Vec<String> {
+        let peers = self.inner.peers.read().await;
+        peers.keys().cloned().collect()
+    }
+
     pub async fn start(&self) -> Result<JoinHandle<()>, ActorError> {
         if !self.is_running().await {
             let actor = self.clone();

@@ -48,7 +48,11 @@ where
 
     async fn run_listener(self, listener: TcpListener) {
         let id = self.actor.id();
-        info!("{}: listening on: {}", self.actor.id(), listener.local_addr().unwrap());
+        info!(
+            "{}: listening on: {}",
+            self.actor.id(),
+            listener.local_addr().unwrap()
+        );
         while let Ok((stream, _)) = listener.accept().await {
             let peer_addr = stream.peer_addr().unwrap().to_string();
             trace!("{}: new connection from: {}", id, peer_addr);
@@ -80,6 +84,10 @@ where
 
     pub async fn stop(&self) {
         self.actor.stop().await;
+    }
+
+    pub async fn peer_ids(&self) -> Vec<String> {
+        self.actor.peer_ids().await
     }
 }
 
@@ -288,6 +296,77 @@ mod tests {
             .unwrap();
 
         assert_eq!("Leader processed: Hello", reply);
+        leader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_multiple_followers() {
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+
+        debug!("Starting test_multiple_followers");
+        let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
+        leader.start("127.0.0.1:8080").await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let follower_count = 3;
+        let mut followers = Vec::new();
+
+        for i in 0..follower_count {
+            let follower =
+                FollowerActor::new(move |msg, _| format!("Follower {} processed: {}", i, msg.data))
+                    .await;
+            follower.actor.start().await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            follower.follow("ws://127.0.0.1:8080").await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            followers.push(follower);
+        }
+
+        trace!("Sending messages to leader from followers");
+        for i in 0..follower_count {
+            let reply = followers[i]
+                .actor
+                .send("leader", format!("Hello from follower {}", i), None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                format!("Leader processed: Hello from follower {}", i),
+                reply
+            );
+        }
+
+        leader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_leader_sends_to_follower() {
+        let _ = env_logger::Builder::new().parse_env("RUST_LOG").try_init();
+
+        debug!("Starting test_leader_sends_to_follower");
+        let leader = LeaderActor::new(|msg, _| format!("Leader processed: {}", msg.data)).await;
+        leader.start("127.0.0.1:8080").await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let follower =
+            FollowerActor::new(|msg, _| format!("Follower processed: {}", msg.data)).await;
+        follower.actor.start().await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        follower.follow("ws://127.0.0.1:8080").await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        trace!("Leader sending message to follower");
+        let reply = leader
+            .actor
+            .send(
+                &leader.peer_ids().await[0].clone(),
+                "Hello from leader".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!("Follower processed: Hello from leader", reply);
         leader.stop().await;
     }
 }
